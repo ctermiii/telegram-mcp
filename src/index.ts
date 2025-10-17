@@ -33,13 +33,25 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 // Telegram API base URL
 const TELEGRAM_API_URL = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
+// Axios instance with timeout configuration
+const axiosInstance = axios.create({
+  timeout: 10000, // 10 second timeout
+  headers: {
+    'Content-Type': 'application/json'
+  }
+});
+
+// Valid urgency levels
+type UrgencyLevel = "low" | "medium" | "high";
+const VALID_URGENCY_LEVELS: UrgencyLevel[] = ["low", "medium", "high"];
+
 /**
  * Create an MCP server with capabilities for tools (to send notifications)
  */
 const server = new Server(
   {
     name: "telegram-mcp",
-    version: "0.1.1" // Incremented version due to significant change
+    version: "1.3.1"
   },
   {
     capabilities: {
@@ -82,15 +94,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           },
           required: ["message", "project"]
-        },
-        outputSchema: { // It's good practice to define output schema
-            type: "object",
-            properties: {
-                telegram_message_id: {
-                    type: "number",
-                    description: "The message_id of the notification sent to Telegram."
-                }
-            }
         }
       },
       {
@@ -119,28 +122,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 /**
- * Helper function to wait for a specified number of milliseconds
- */
-// function sleep(ms: number): Promise<void> { // Kept for potential future use, but not used currently
-//   return new Promise(resolve => setTimeout(resolve, ms));
-// }
-
-/**
  * Handler for the notification tools.
  */
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   switch (request.params.name) {
     case "send_notification": {
-      const message = String(request.params.arguments?.message);
-      const project = String(request.params.arguments?.project);
-      const urgency = String(request.params.arguments?.urgency || "medium");
+      const args = request.params.arguments;
+
+      // Validate required parameters
+      if (!args?.message || typeof args.message !== 'string') {
+        return {
+          content: [{ type: "text", text: "Invalid or missing 'message' parameter. Must be a non-empty string." }],
+          isError: true,
+        };
+      }
+
+      if (!args?.project || typeof args.project !== 'string') {
+        return {
+          content: [{ type: "text", text: "Invalid or missing 'project' parameter. Must be a non-empty string." }],
+          isError: true,
+        };
+      }
+
+      const message = args.message.trim();
+      const project = args.project.trim();
 
       if (!message || !project) {
         return {
-            content: [{ type: "text", text: "Message and project are required for send_notification." }],
-            isError: true,
+          content: [{ type: "text", text: "Message and project cannot be empty." }],
+          isError: true,
         };
       }
+
+      // Validate and sanitize urgency
+      const urgencyInput = args?.urgency ? String(args.urgency).toLowerCase() : "medium";
+      const urgency: UrgencyLevel = VALID_URGENCY_LEVELS.includes(urgencyInput as UrgencyLevel)
+        ? (urgencyInput as UrgencyLevel)
+        : "medium";
 
       // Format the message with project name and urgency
       let urgencyPrefix = "";
@@ -154,23 +172,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       try {
         // Send the message using Telegram Bot API
-        const response = await axios.post(`${TELEGRAM_API_URL}/sendMessage`, {
+        const response = await axiosInstance.post(`${TELEGRAM_API_URL}/sendMessage`, {
           chat_id: TELEGRAM_CHAT_ID,
           text: formattedMessage,
           parse_mode: 'Markdown'
         });
 
-        if (!response.data.ok || !response.data.result || !response.data.result.message_id) {
-          console.error(`Telegram API error on send: ${response.data.description || 'Unknown Telegram error'}`);
+        if (!response.data?.ok || !response.data?.result?.message_id) {
+          const errorDesc = response.data?.description || 'Unknown Telegram error';
+          console.error(`Telegram API error on send: ${errorDesc}`);
           return {
             content: [{
               type: "text",
-              text: `Failed to send Telegram notification. Error: ${response.data.description || 'Unknown Telegram error'}`
+              text: `Failed to send Telegram notification. Error: ${errorDesc}`
             }],
             isError: true
           };
         }
-        
+
         const sentMessageId = response.data.result.message_id;
         console.error(`Notification sent via Telegram. Message ID: ${sentMessageId}`);
 
@@ -180,8 +199,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: `Notification sent successfully. Message ID: ${sentMessageId}`
           }],
-          toolMetadata: { // MCP allows for tool-specific metadata
-            telegram_message_id: sentMessageId 
+          toolMetadata: {
+            telegram_message_id: sentMessageId
           }
         };
 
@@ -189,13 +208,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Log detailed error information
         console.error("Error sending Telegram notification:", error);
         let errorMessage = "Unknown error occurred while sending notification.";
-        if (axios.isAxiosError(error) && error.response) {
-          const telegramError = error.response.data;
-          errorMessage = `Telegram API error: ${telegramError.description || error.message}`;
-          console.error(`Telegram error details:`, telegramError);
+
+        if (axios.isAxiosError(error)) {
+          if (error.code === 'ECONNABORTED') {
+            errorMessage = "Request timeout: The Telegram API did not respond in time.";
+          } else if (error.response) {
+            const telegramError = error.response.data;
+            errorMessage = `Telegram API error: ${telegramError?.description || error.message}`;
+            console.error(`Telegram error details:`, telegramError);
+          } else if (error.request) {
+            errorMessage = "Network error: Unable to reach Telegram API.";
+          } else {
+            errorMessage = `Request error: ${error.message}`;
+          }
         } else if (error instanceof Error) {
           errorMessage = error.message;
         }
+
         return {
           content: [{ type: "text", text: errorMessage }],
           isError: true,
@@ -204,78 +233,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "check_notification_response": {
-      // const messageId = Number(request.params.arguments?.message_id); // Parameters are still defined in schema
-      // const timeoutSeconds = Number(request.params.arguments?.timeout_seconds || 30);
-
       console.warn(`Tool "check_notification_response" was called, but it is disabled due to an active webhook on the Telegram bot which prevents polling (getUpdates). Message ID: ${request.params.arguments?.message_id}`);
-      
+
       return {
         content: [{
           type: "text",
           text: "Polling for responses is disabled because a webhook is active on the Telegram bot. Please use an alternative method (e.g., a webhook handler) to process user responses."
         }],
-        isError: false // Not a server error, but an operational constraint
+        isError: false
       };
-
-      /* --- Original polling logic commented out due to webhook conflict ---
-      // const messageId = Number(request.params.arguments?.message_id);
-      // const timeoutSeconds = Number(request.params.arguments?.timeout_seconds || 60); 
-
-      // if (isNaN(messageId) || messageId <= 0) {
-      //   throw new Error("Valid message_id is required");
-      // }
-      // console.error(`Checking for responses to message ID: ${messageId}`);
-      // const startTime = Date.now();
-      // const timeoutMs = timeoutSeconds * 1000;
-      // try {
-      //   while (Date.now() - startTime < timeoutMs) {
-      //     const response = await axios.get(`${TELEGRAM_API_URL}/getUpdates`, {
-      //       params: {
-      //         offset: -1, 
-      //         limit: 10 
-      //       }
-      //     });
-      //     if (response.data.ok && response.data.result.length > 0) {
-      //       const newMessages = response.data.result
-      //         .filter((update: any) => update.message && update.message.message_id > messageId)
-      //         .sort((a: any, b: any) => a.message.message_id - b.message.message_id);
-      //       if (newMessages.length > 0) {
-      //         const latestMessage = newMessages[newMessages.length - 1];
-      //         console.error(`Found new message with higher ID than ${messageId}: ${latestMessage.message.text}`);
-      //         return {
-      //           content: [{
-      //             type: "text",
-      //             text: latestMessage.message.text
-      //           }]
-      //         };
-      //       }
-      //     }
-      //     await sleep(2000);
-      //   }
-      //   return {
-      //     content: [{
-      //       type: "text",
-      //       text: "User not available or did not respond within timeout." // Adjusted message
-      //     }]
-      //   };
-      // } catch (error) {
-      //   console.error("Error checking for notification responses:", error);
-      //   let errorMessage = "Unknown error occurred";
-      //   if (axios.isAxiosError(error) && error.response) {
-      //     const telegramError = error.response.data;
-      //     errorMessage = `Telegram API error: ${telegramError.description || error.message}`;
-      //   } else if (error instanceof Error) {
-      //     errorMessage = error.message;
-      //   }
-      //   return {
-      //     content: [{
-      //       type: "text",
-      //       text: `Failed to check for responses. ${errorMessage}`
-      //     }],
-      //     isError: true
-      //   };
-      // }
-      */
     }
 
     default:

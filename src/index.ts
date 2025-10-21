@@ -174,8 +174,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Send the message using Telegram Bot API
         const response = await axiosInstance.post(`${TELEGRAM_API_URL}/sendMessage`, {
           chat_id: TELEGRAM_CHAT_ID,
-          text: formattedMessage,
-          parse_mode: 'Markdown'
+          text: formattedMessage
         });
 
         if (!response.data?.ok || !response.data?.result?.message_id) {

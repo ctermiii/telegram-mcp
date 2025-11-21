@@ -45,6 +45,27 @@ const axiosInstance = axios.create({
 type UrgencyLevel = "low" | "medium" | "high";
 const VALID_URGENCY_LEVELS: UrgencyLevel[] = ["low", "medium", "high"];
 
+// Valid message formats
+type MessageFormat = "plain_text" | "markdown_v2";
+const VALID_MESSAGE_FORMATS: MessageFormat[] = ["plain_text", "markdown_v2"];
+
+/**
+ * Escape text for Telegram MarkdownV2 format
+ * https://core.telegram.org/bots/api#markdownv2-style
+ */
+function escapeMarkdownV2(text: string): string {
+  return text.replace(/[\[\]()~>#+\-=|{}.!]/g, "\\$&");
+}
+
+/**
+ * Structured logging function
+ */
+const log = (level: 'info' | 'warn' | 'error', message: string, data?: any) => {
+  const timestamp = new Date().toISOString();
+  const logEntry = { timestamp, level, message, ...(data || {}) };
+  console.error(JSON.stringify(logEntry));
+};
+
 /**
  * Create an MCP server with capabilities for tools (to send notifications)
  */
@@ -69,13 +90,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "send_notification",
-        description: "Send a text message notification to the user. Supports Markdown formatting for messages. Use backticks for code blocks and inline code. Use square brackets for placeholders. This tool sends the notification and returns the message_id. It does NOT wait for a response.",
+        description: "Send a text message notification to the user. Supports both plain text and MarkdownV2 formatting. This tool sends the notification and returns the message_id. It does NOT wait for a response.",
         inputSchema: {
           type: "object",
           properties: {
             message: {
               type: "string",
-              description: "The message to send to the user. Supports Markdown formatting.",
+              description: "The message to send to the user. Supports MarkdownV2 formatting when format is set to markdown_v2.",
               examples: [
                 "Here's how to create a storage account:\n\n`az storage account create --name [storage-name] --resource-group [rg-name]`\n\nReplace:\n- `[storage-name]`: Your storage account name\n- `[rg-name]`: Your resource group",
                 "Would you like me to help you set up Azure DevOps integration?"
@@ -91,6 +112,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               enum: ["low", "medium", "high"],
               description: "The urgency of the notification. Affects message formatting:\n- high: Prefixes with 🚨 URGENT\n- medium: Prefixes with ⚠️\n- low: No prefix",
               default: "medium"
+            },
+            format: {
+              type: "string",
+              enum: ["plain_text", "markdown_v2"],
+              description: "The message format to use. Defaults to plain_text.",
+              examples: ["plain_text", "markdown_v2"],
+              default: "plain_text"
             }
           },
           required: ["message", "project"]
@@ -98,7 +126,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "check_notification_response",
-        description: "DISABLED: This tool is disabled because a webhook is active for the Telegram bot, which prevents the use of polling (getUpdates). An alternative mechanism is needed to handle responses if webhook is active.",
+        description: "Checks if the user has responded to a previously sent notification. DISABLED by default because a webhook is active for the Telegram bot, which prevents the use of polling (getUpdates). To enable, first disable the webhook using: https://api.telegram.org/bot<YOUR_BOT_TOKEN>/deleteWebhook",
         inputSchema: {
           type: "object",
           properties: {
@@ -130,14 +158,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const args = request.params.arguments;
 
       // Validate required parameters
-      if (!args?.message || typeof args.message !== 'string') {
+      if (typeof args !== 'object' || args === null) {
+        return {
+          content: [{ type: "text", text: "Invalid arguments format. Must be an object." }],
+          isError: true,
+        };
+      }
+
+      if (typeof args.message !== 'string' || args.message.trim() === '') {
         return {
           content: [{ type: "text", text: "Invalid or missing 'message' parameter. Must be a non-empty string." }],
           isError: true,
         };
       }
 
-      if (!args?.project || typeof args.project !== 'string') {
+      if (typeof args.project !== 'string' || args.project.trim() === '') {
         return {
           content: [{ type: "text", text: "Invalid or missing 'project' parameter. Must be a non-empty string." }],
           isError: true,
@@ -147,18 +182,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const message = args.message.trim();
       const project = args.project.trim();
 
-      if (!message || !project) {
-        return {
-          content: [{ type: "text", text: "Message and project cannot be empty." }],
-          isError: true,
-        };
-      }
-
       // Validate and sanitize urgency
-      const urgencyInput = args?.urgency ? String(args.urgency).toLowerCase() : "medium";
+      const urgencyInput = args.urgency ? String(args.urgency).toLowerCase() : "medium";
       const urgency: UrgencyLevel = VALID_URGENCY_LEVELS.includes(urgencyInput as UrgencyLevel)
         ? (urgencyInput as UrgencyLevel)
         : "medium";
+
+      // Validate and sanitize message format
+      const formatInput = args.format ? String(args.format).toLowerCase() : "plain_text";
+      const format: MessageFormat = VALID_MESSAGE_FORMATS.includes(formatInput as MessageFormat)
+        ? (formatInput as MessageFormat)
+        : "plain_text";
 
       // Format the message with project name and urgency
       let urgencyPrefix = "";
@@ -168,18 +202,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         urgencyPrefix = "⚠️ ";
       }
 
-      const formattedMessage = `${urgencyPrefix}LLM Question (${project}):\n\n${message}`;
+      let formattedMessage = `${urgencyPrefix}LLM Question (${project}):\n\n${message}`;
+
+      // Prepare Telegram API payload
+      const telegramPayload: any = {
+        chat_id: TELEGRAM_CHAT_ID,
+        text: formattedMessage
+      };
+
+      // Apply formatting if needed
+      if (format === "markdown_v2") {
+        telegramPayload.parse_mode = "MarkdownV2";
+        // Escape the entire message for MarkdownV2
+        telegramPayload.text = escapeMarkdownV2(formattedMessage);
+      }
 
       try {
         // Send the message using Telegram Bot API
-        const response = await axiosInstance.post(`${TELEGRAM_API_URL}/sendMessage`, {
-          chat_id: TELEGRAM_CHAT_ID,
-          text: formattedMessage
-        });
+        const response = await axiosInstance.post(`${TELEGRAM_API_URL}/sendMessage`, telegramPayload);
 
         if (!response.data?.ok || !response.data?.result?.message_id) {
           const errorDesc = response.data?.description || 'Unknown Telegram error';
-          console.error(`Telegram API error on send: ${errorDesc}`);
+          log('error', 'Telegram API error on send', { error: errorDesc });
           return {
             content: [{
               type: "text",
@@ -190,7 +234,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const sentMessageId = response.data.result.message_id;
-        console.error(`Notification sent via Telegram. Message ID: ${sentMessageId}`);
+        log('info', 'Notification sent via Telegram', { message_id: sentMessageId, project, urgency, format });
 
         // Return success with the message_id
         return {
@@ -205,20 +249,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       } catch (error) {
         // Log detailed error information
-        console.error("Error sending Telegram notification:", error);
+        log('error', 'Error sending Telegram notification', { error: String(error) });
+
         let errorMessage = "Unknown error occurred while sending notification.";
 
         if (axios.isAxiosError(error)) {
           if (error.code === 'ECONNABORTED') {
             errorMessage = "Request timeout: The Telegram API did not respond in time.";
+            log('error', 'Telegram API timeout', { code: error.code });
           } else if (error.response) {
             const telegramError = error.response.data;
             errorMessage = `Telegram API error: ${telegramError?.description || error.message}`;
-            console.error(`Telegram error details:`, telegramError);
+            log('error', 'Telegram API response error', { response: error.response.data });
           } else if (error.request) {
             errorMessage = "Network error: Unable to reach Telegram API.";
+            log('error', 'Telegram network error', { request: String(error.request) });
           } else {
             errorMessage = `Request error: ${error.message}`;
+            log('error', 'Telegram request error', { message: error.message });
           }
         } else if (error instanceof Error) {
           errorMessage = error.message;
@@ -232,7 +280,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "check_notification_response": {
-      console.warn(`Tool "check_notification_response" was called, but it is disabled due to an active webhook on the Telegram bot which prevents polling (getUpdates). Message ID: ${request.params.arguments?.message_id}`);
+      log('warn', 'Tool "check_notification_response" was called, but it is disabled due to an active webhook on the Telegram bot which prevents polling (getUpdates).', {
+        message_id: request.params.arguments?.message_id
+      });
 
       return {
         content: [{
@@ -245,7 +295,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     default:
       // It's better to return a structured error for unknown tools
-      console.error(`Unknown tool called: ${request.params.name}`);
+      log('error', 'Unknown tool called', { tool_name: request.params.name });
       return {
           content: [{ type: "text", text: `Error: Unknown tool name '${request.params.name}'.` }],
           isError: true,
@@ -260,11 +310,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Telegram MCP server running on stdio. Polling for responses is DISABLED if a webhook is active.");
+  log('info', "Telegram MCP server running on stdio. Polling for responses is DISABLED if a webhook is active.");
 }
 
 main().catch((error) => {
-  console.error("Server error:", error);
+  log('error', "Server error", { error: String(error) });
   process.exit(1);
 });
 
